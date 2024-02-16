@@ -1,0 +1,199 @@
+package pgmfx
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/myfantasy/ints"
+	"github.com/myfantasy/mfctx"
+)
+
+const ConnectionIDLogParam = "conn_id"
+const ConnectionLockedLogParam = "locked"
+const ConnectionCheckCloseLogParam = "do_cls"
+
+type FreeConnectionFunc func()
+
+func freeConnectionFuncExample() {}
+
+type Connection struct {
+	PgxConn *pgx.Conn
+
+	InUse        bool
+	IsTerminated bool
+	StartTime    time.Time
+	ID           string
+
+	Cfg *ConnectConfig
+
+	mx sync.Mutex
+}
+
+func MakeConnection(cfg *ConnectConfig, conn *pgx.Conn) *Connection {
+	return &Connection{
+		PgxConn:   conn,
+		StartTime: time.Now(),
+		ID:        ints.NextUUID().Text(62),
+		Cfg:       cfg,
+	}
+}
+
+// LockDo - do any with lock from this connection
+func (c *Connection) LockDo(f func()) {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	f()
+}
+
+// Close - close connection with lock
+func (c *Connection) Close(ctxIn context.Context) (err error) {
+	ctx := mfctx.FromCtx(ctxIn).Start("pgmfx.Connection.Close")
+	ctx.With(ConnectionIDLogParam, c.ID)
+	defer func() { ctx.Complete(err) }()
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.CloseInternal(ctx)
+}
+
+// CloseInternal - close connection without lock (use Close)
+func (c *Connection) CloseInternal(ctxIn context.Context) (err error) {
+	ctx := mfctx.FromCtx(ctxIn).Start("pgmfx.Connection.CloseInternal")
+	ctx.With(ConnectionIDLogParam, c.ID)
+	defer func() { ctx.Complete(err) }()
+	if c.InUse {
+		return ErrInUse
+	}
+
+	if c.IsTerminated {
+		return nil
+	}
+
+	err = c.PgxConn.Close(ctx)
+
+	if err != nil {
+		return errors.Join(ErrPgxClose, err)
+	}
+
+	c.IsTerminated = true
+
+	return nil
+}
+
+// CheckIsTerminated - check connection in terminated state with lock
+func (c *Connection) CheckIsTerminated() bool {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.CheckIsTerminatedInternal()
+}
+
+// CheckIsTerminatedInternal - check connection in terminated state without lock (use CheckIsTerminated)
+func (c *Connection) CheckIsTerminatedInternal() bool {
+	return c.IsTerminated
+}
+
+// CheckInUse - check connection in use with lock
+func (c *Connection) CheckInUse() bool {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.CheckInUseInternal()
+}
+
+// CheckInUseInternal - check connection in use without lock (use CheckInUse)
+func (c *Connection) CheckInUseInternal() bool {
+	return c.InUse
+}
+
+// CheckExpired - checks expired open timeout
+func (c *Connection) CheckExpired() bool {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.CheckExpiredInternal()
+}
+
+// CheckExpiredInternal - checks expired open timeout  (use CheckExpired)
+func (c *Connection) CheckExpiredInternal() bool {
+	return c.Cfg != nil && c.Cfg.OpenTimeout > 0 && time.Now().After(c.StartTime.Add(c.Cfg.OpenTimeout))
+}
+
+// CanUse - check connection may be used with lock
+func (c *Connection) CanUse() bool {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.CanUseInternal()
+}
+
+// CanUseInternal - check connection in use without lock (use CanUse)
+func (c *Connection) CanUseInternal() bool {
+	expired := c.CheckExpiredInternal()
+	return !c.InUse && !c.IsTerminated && !expired
+}
+
+// TryLock - try locks for use with lock
+// free is never nil
+// use l, f := c.TryLock(ctx)
+// defer free
+func (c *Connection) TryLock(ctxIn context.Context) (locked bool, free FreeConnectionFunc) {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	locked, free = c.TryLockInternal(ctxIn)
+
+	if locked {
+		free = func() {
+			c.mx.Lock()
+			defer c.mx.Unlock()
+			free()
+		}
+	}
+
+	return locked, free
+}
+
+// TryLockInternal - try locks for use without lock (use TryLock)
+func (c *Connection) TryLockInternal(ctxIn context.Context) (locked bool, free FreeConnectionFunc) {
+	ctx := mfctx.FromCtx(ctxIn).Start("pgmfx.Connection.TryLockInternal")
+	ctx.With(ConnectionIDLogParam, c.ID)
+	defer func() { ctx.Complete(nil) }()
+	defer func() { ctx.With(ConnectionLockedLogParam, locked) }()
+
+	if !c.CanUseInternal() {
+		return false, freeConnectionFuncExample
+	}
+
+	c.InUse = true
+
+	return true, func() {
+		ctx := mfctx.FromCtx(ctxIn).Start("pgmfx.Connection.TryLockInternal.free")
+		ctx.With(ConnectionIDLogParam, c.ID)
+		defer func() { ctx.Complete(nil) }()
+		c.InUse = false
+	}
+}
+
+// CheckAndClose - close connection when Cfg is set; doClose - close was tryed; with lock
+func (c *Connection) CheckAndClose(ctxIn context.Context) (doClose bool, err error) {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.CheckAndCloseInternal(ctxIn)
+}
+
+// CheckAndCloseInternal - close connection when Cfg is set; doClose - close was tryed; without lock so use (CheckAndClose)
+func (c *Connection) CheckAndCloseInternal(ctxIn context.Context) (doClose bool, err error) {
+	ctx := mfctx.FromCtx(ctxIn).Start("pgmfx.Connection.CheckAndCloseInternal")
+	ctx.With(ConnectionIDLogParam, c.ID)
+	defer func() { ctx.Complete(err) }()
+	defer func() { ctx.With(ConnectionCheckCloseLogParam, doClose) }()
+
+	if c.InUse {
+		return false, nil
+	}
+	if !c.CheckExpiredInternal() {
+		return false, nil
+	}
+
+	err = c.Close(ctx)
+
+	return true, err
+}
