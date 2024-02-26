@@ -20,7 +20,7 @@ func main() {
 	oncfg.SetDefault(cfg)
 	oncfg.SetDefaultPwd(cfg)
 
-	pool, err := cfg.MakePool(context.Background())
+	pool, err := cfg.MakePool(context.Background(), nil)
 
 	if err != nil {
 		panic(err)

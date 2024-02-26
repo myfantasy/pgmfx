@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -17,7 +18,10 @@ func main() {
 	oncfg.SetDefault(cfg)
 	oncfg.SetDefaultPwd(cfg)
 
-	pool, err := cfg.MakePool(context.Background())
+	bbb, _ := json.MarshalIndent(cfg, "", " ")
+	fmt.Println(string(bbb))
+
+	pool, err := cfg.MakePool(context.Background(), nil)
 
 	if err != nil {
 		panic(err)

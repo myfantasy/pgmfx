@@ -18,6 +18,8 @@ type PgxMFPool struct {
 	PoolName                func() string
 	MetricsProvider         MetricsProvider
 	GetNewConnectionTimeout poh.ExpireDurationFunc
+
+	cfg *ConnectConfig
 }
 
 // ConnectConfig connection config and pool config
@@ -61,10 +63,11 @@ func (cfg *ConnectConfig) MakeConnection(ctxIn context.Context) (cnct *poh.Conne
 	return cnct, nil
 }
 
-func (cfg *ConnectConfig) MakePool(ctxBase context.Context) (pool *PgxMFPool, err error) {
+func (cfg *ConnectConfig) MakePool(ctxBase context.Context, ctxClose context.CancelCauseFunc) (pool *PgxMFPool, err error) {
 	ctx := mfctx.FromCtx(ctxBase).Start("pgmfx.ConnectConfig.MakeConnection")
 	defer func() { ctx.Complete(err) }()
 	cp := poh.MakeConnectionPool[*pgx.Conn](ctxBase,
+		ctxClose,
 		cfg.MakeConnection,
 		func() int { return cfg.MaxConnections },
 		func() int { return cfg.MinConnections },
@@ -78,6 +81,8 @@ func (cfg *ConnectConfig) MakePool(ctxBase context.Context) (pool *PgxMFPool, er
 		GetNewConnectionTimeout: func() time.Duration {
 			return cfg.PoolGetConnectionTimeout
 		},
+
+		cfg: cfg,
 	}, nil
 }
 
@@ -139,6 +144,10 @@ func RowsProcessJson(js *json.RawMessage, exists *bool) RowsProcess {
 
 		return nil
 	}
+}
+
+func (pool PgxMFPool) Cfg() *ConnectConfig {
+	return pool.cfg
 }
 
 func (pool PgxMFPool) Query(ctxIn context.Context, rp RowsProcess, sqlName string, sql string, args ...any) (err error) {
